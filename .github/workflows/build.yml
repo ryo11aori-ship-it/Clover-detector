@@ -1,4 +1,4 @@
-name: Build Clover Finder Exe
+name: Build and Test Clover Finder
 
 on:
   push:
@@ -26,8 +26,16 @@ jobs:
       run: |
         pyinstaller --onefile --name fourleaf_finder main.py
 
-    - name: Upload Exe Artifact
+    - name: Run Clover Finder on Sample Image
+      run: |
+        # exeを実行して、リポジトリ直下のclover.JPGを食わせる
+        # 実行場所はリポジトリルートなので、パス指定はこの形でOK
+        ./dist/fourleaf_finder.exe clover.JPG
+
+    - name: Upload Artifacts (Exe and Result)
       uses: actions/upload-artifact@v4
       with:
-        name: fourleaf_finder_exe
-        path: dist/fourleaf_finder.exe
+        name: fourleaf_finder_result
+        path: |
+          dist/fourleaf_finder.exe
+          clover_marked.png
