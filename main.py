@@ -4,117 +4,122 @@ import sys
 import os
 
 def main():
-    # --- 入力処理 ---
-    if len(sys.argv) < 2: 
-        print("Usage: exe <img_path>")
-        return
+    if len(sys.argv) < 2: print("Usage: exe <img_path>"); return
     input_path = sys.argv[1]
-    if not os.path.exists(input_path): 
-        print(f"Error: File not found {input_path}")
-        return
+    if not os.path.exists(input_path): print("File not found"); return
     
     img = cv2.imread(input_path)
     if img is None: return
     output_img = img.copy()
 
-    # --- STEP 1: 緑色の抽出（より繊細に） ---
-    # ブラーを弱める（葉の境目を消さないため）
-    blurred = cv2.GaussianBlur(img, (3, 3), 0)
+    # --- STEP 1: ノイズを抹殺する ---
+    # 強めのブラーをかけて、葉脈や模様を消し去る
+    blurred = cv2.medianBlur(img, 15)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     
-    # 緑マスク（少し暗めも拾う設定）
-    lower_green = np.array([30, 40, 40])
-    upper_green = np.array([90, 255, 255])
+    # 緑色マスク (かなり限定的に)
+    lower_green = np.array([35, 60, 60])
+    upper_green = np.array([85, 255, 255])
     mask = cv2.inRange(hsv, lower_green, upper_green)
     
-    # ノイズ処理：小さな穴は埋めるが、葉の間の隙間（黒い線）は埋めないように注意
-    kernel = np.ones((3,3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    # --- STEP 2: 侵食（Erosion）で分離 ---
+    # ここが今回の肝。「葉っぱをガリガリ削って小さくする」
+    # これにより、隣接する葉っぱとの結合を切断する
+    kernel = np.ones((5,5), np.uint8)
+    
+    # iterationsの回数だけ削る。この回数が重要。
+    # 密集地帯なので、思いっきり削って「芯」だけ残す作戦
+    eroded_mask = cv2.erode(mask, kernel, iterations=8)
+    
+    # 削りすぎて消えちゃった部分を少しだけ戻す（膨張）して形を整える
+    # ただし、戻しすぎるとまたくっつくので控えめに
+    dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=2)
 
-    # --- STEP 2: 距離変換 ---
-    dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
-    
-    # --- STEP 3: ローカルマキシマ（局所的な山頂）を探す ---
-    # ここが今回のキモ。全体基準ではなく「隣より高いか」を見る
-    
-    # 1. 距離画像を膨張させる（各ピクセルに周辺の最大値を代入）
-    dilated = cv2.dilate(dist_transform, np.ones((3,3), np.uint8))
-    
-    # 2. 「元の値 == 膨張後の値」の場所が、周辺で一番高い場所（ピーク）
-    local_peaks = (dist_transform == dilated)
-    
-    # 3. ノイズ除去：ピークの中でも、ある程度「葉っぱっぽい厚み」があるものだけ残す
-    # 閾値を下げて（0.1倍）、平べったい葉っぱも拾う
-    peak_threshold = 0.1 * dist_transform.max()
-    peaks_mask = local_peaks & (dist_transform > peak_threshold)
-    
-    # ピーク座標の取得
-    # np.where は (y_array, x_array) を返す
-    y_peaks, x_peaks = np.where(peaks_mask)
-    
-    # 座標リスト化 (x, y)
-    leaf_centers = list(zip(x_peaks, y_peaks))
-    
-    print(f"Leaf peaks found: {len(leaf_centers)}")
+    # デバッグ用にマスク画像を保存（どう認識されてるか確認用）
+    cv2.imwrite("debug_mask.png", dilated_mask)
 
-    # 青ドット描画（デバッグ用：今度は四つ葉の上にも出るはず！）
+    # --- STEP 3: 芯（重心）を見つける ---
+    contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    leaf_centers = []
+    min_area = 20 # 削りすぎたゴミは無視
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > min_area:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                leaf_centers.append((cX, cY))
+                
+    print(f"Leaf cores found: {len(leaf_centers)}")
+    
+    # 青ドット（芯）を描画
     for x, y in leaf_centers:
-        cv2.circle(output_img, (x, y), 2, (255, 0, 0), -1)
+        cv2.circle(output_img, (x, y), 3, (255, 0, 0), -1)
 
-    # --- STEP 4: 密集判定（近傍4点ロジック） ---
-    # 判定を少し甘くする（四角形っぽくなくても、近くにあればOK）
+    # --- STEP 4: クールなクラスタリング ---
+    # 「半径R以内に自分を含めて4つ芯があるか？」
     
-    search_radius = 40  # 画素数固定（画像の解像度に合わせて調整が必要かも）
-    clover_candidates = []
+    search_radius = 55 # 画像サイズに合わせて微調整した値
+    found_groups = []
 
-    for i in range(len(leaf_centers)):
-        c1 = leaf_centers[i]
+    for i, p1 in enumerate(leaf_centers):
         neighbors = []
+        for j, p2 in enumerate(leaf_centers):
+            dist = np.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+            if dist < search_radius:
+                neighbors.append(p2)
         
-        for j in range(len(leaf_centers)):
-            c2 = leaf_centers[j]
-            d = np.sqrt((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)
-            if d < search_radius:
-                neighbors.append(c2)
-        
-        # 自分を含めて4つ以上あれば候補
-        if len(neighbors) >= 4:
-            # 重心を計算
-            cx = int(sum([n[0] for n in neighbors]) / len(neighbors))
-            cy = int(sum([n[1] for n in neighbors]) / len(neighbors))
+        if len(neighbors) == 4:
+            # 4つの重心
+            cx = int(sum([n[0] for n in neighbors]) / 4)
+            cy = int(sum([n[1] for n in neighbors]) / 4)
             
-            # 重複チェック
-            is_new = True
-            for existing in clover_candidates:
-                if np.sqrt((existing[0]-cx)**2 + (existing[1]-cy)**2) < 20:
-                    is_new = False
-                    break
+            # 形状チェック（正方形に近いか？）
+            # 重心からの距離の分散を見ることで、細長い誤検出を防ぐ
+            dists_from_center = [np.sqrt((n[0]-cx)**2 + (n[1]-cy)**2) for n in neighbors]
+            dist_std = np.std(dists_from_center)
             
-            if is_new:
-                clover_candidates.append((cx, cy))
+            # バラつきが少ない（＝綺麗な放射状）場合のみ採用
+            if dist_std < 15:
+                # 重複排除
+                is_new = True
+                for g in found_groups:
+                    if np.sqrt((g[0]-cx)**2 + (g[1]-cy)**2) < 20:
+                        is_new = False
+                        break
+                if is_new:
+                    found_groups.append((cx, cy))
 
-    # --- STEP 5: 結果描画 ---
-    if len(clover_candidates) > 0:
-        for cx, cy in clover_candidates:
-            print(f"Lucky Clover at ({cx}, {cy})")
-            # 派手にマーク
-            cv2.circle(output_img, (cx, cy), 40, (0, 0, 255), 4)
-            cv2.putText(output_img, "4-LEAF!", (cx-30, cy-30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    # --- STEP 5: 描画 ---
+    if len(found_groups) > 0:
+        for cx, cy in found_groups:
+            print(f"FOUND at ({cx}, {cy})")
+            cv2.circle(output_img, (cx, cy), 50, (0, 0, 255), 4)
+            cv2.putText(output_img, "FOUND!", (cx-40, cy-40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
     else:
-        print("No 4-leaf found... detecting 3-leaf clusters instead.")
-        # ボウズ回避：3つ組を探して黄色で出す
-        for i in range(len(leaf_centers)):
-            c1 = leaf_centers[i]
-            neighbors = [c2 for c2 in leaf_centers if np.sqrt((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2) < search_radius]
-            if len(neighbors) == 3:
-                cx = int(sum([n[0] for n in neighbors]) / 3)
-                cy = int(sum([n[1] for n in neighbors]) / 3)
-                cv2.circle(output_img, (cx, cy), 30, (0, 255, 255), 2)
+        # 万が一見つからなかったら「一番それっぽい場所」を推定
+        print("Strict mode failed. Guessing...")
+        max_neighbors = 0
+        best_spot = None
+        for i, p1 in enumerate(leaf_centers):
+             neighbors = [p2 for p2 in leaf_centers if np.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2) < search_radius]
+             if len(neighbors) > max_neighbors:
+                 max_neighbors = len(neighbors)
+                 cx = int(sum([n[0] for n in neighbors]) / len(neighbors))
+                 cy = int(sum([n[1] for n in neighbors]) / len(neighbors))
+                 best_spot = (cx, cy)
+        
+        if best_spot:
+             cv2.circle(output_img, best_spot, 50, (0, 255, 255), 3)
+             cv2.putText(output_img, f"Maybe? ({max_neighbors})", (best_spot[0]-40, best_spot[1]-40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-    # 保存
     cv2.imwrite("clover_marked.png", output_img)
-    print("Saved clover_marked.png")
+    print("Saved.")
 
 if __name__ == "__main__":
     main()
