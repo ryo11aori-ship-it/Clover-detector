@@ -28,14 +28,19 @@ jobs:
 
     - name: Run Clover Finder on Sample Image
       run: |
-        # exeを実行して、リポジトリ直下のclover.JPGを食わせる
-        # 実行場所はリポジトリルートなので、パス指定はこの形でOK
+        # リポジトリ直下のclover.JPGを読み込ませる
         ./dist/fourleaf_finder.exe clover.JPG
 
-    - name: Upload Artifacts (Exe and Result)
+    # ここを変更：exeのみをアップロード
+    - name: Upload Exe
       uses: actions/upload-artifact@v4
       with:
-        name: fourleaf_finder_result
-        path: |
-          dist/fourleaf_finder.exe
-          clover_marked.png
+        name: fourleaf_finder_exe
+        path: dist/fourleaf_finder.exe
+
+    # 追加：結果画像のみを別の名前でアップロード
+    - name: Upload Result Image
+      uses: actions/upload-artifact@v4
+      with:
+        name: detection_result_image
+        path: clover_marked.png
