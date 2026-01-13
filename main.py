@@ -2,128 +2,120 @@ import cv2
 import numpy as np
 import sys
 import os
+import itertools
 
 def main():
-    # 入力チェック
-    if len(sys.argv) < 2: 
-        print("Usage: clover_finder.exe <image_path>")
-        return
+    # --- 入力処理 ---
+    if len(sys.argv) < 2: print("Usage: exe <img_path>"); return
     input_path = sys.argv[1]
-    if not os.path.exists(input_path): 
-        print(f"Error: File not found {input_path}")
-        return
+    if not os.path.exists(input_path): print("File not found"); return
     
     img = cv2.imread(input_path)
-    if img is None: 
-        print("Error: Failed to load image.")
-        return
-    
+    if img is None: return
     output_img = img.copy()
-    
-    # --- STEP 1: 画像を見やすくする（前処理） ---
-    # ガウシアンブラーでノイズを散らす
+
+    # --- STEP 1: 緑色の抽出 ---
+    # 少しボカしてノイズ低減
     blurred = cv2.GaussianBlur(img, (5, 5), 0)
-    
-    # HSV変換
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     
-    # 緑色の範囲を少し広げる（影の部分も拾えるように）
-    # Hue: 30-90, Saturation: 30-255, Value: 30-255
-    lower_green = np.array([30, 30, 30])
+    # 緑色マスク作成 (範囲は広めに)
+    lower_green = np.array([25, 40, 40])
     upper_green = np.array([90, 255, 255])
     mask = cv2.inRange(hsv, lower_green, upper_green)
     
-    # 穴埋め処理（葉脈などで切れないように）
+    # ノイズ除去（小さなゴミを消す）
     kernel = np.ones((3,3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
     
-    # --- STEP 2: 輪郭抽出 ---
-    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    # --- STEP 2: 距離変換で「葉の中心」を探す ---
+    # 緑色の領域内で、黒い境界からどれだけ遠いかを数値化
+    # これにより、くっついた葉っぱの中心が「山頂」のように浮き出る
+    dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     
-    candidates = []
+    # 正規化（デバッグ用・可視化のため0-255にするが計算にはdist_transformを使う）
+    dist_norm = cv2.normalize(dist_transform, None, 0, 1.0, cv2.NORM_MINMAX)
+
+    # 「確実な葉っぱの中心」だけを取り出す閾値処理
+    # 画像全体の最大ピークの x% 以上の高さがある部分だけを残す
+    # この調整が肝。0.3くらいに下げて、隠れた葉っぱも拾う
+    _, sure_fg = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
     
-    print(f"Total contours found: {len(contours)}")
+    # --- STEP 3: 中心点の座標を取得 ---
+    # 連結成分解析で、各「山頂」の座標を得る
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(sure_fg)
     
-    # --- STEP 3: 形状解析（凹凸を数える） ---
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
+    print(f"Leaflets found: {num_labels - 1}")
+    
+    # 重心リストを作成 (背景であるインデックス0は除外)
+    leaf_centers = []
+    for i in range(1, num_labels):
+        # 面積フィルタ：あまりに小さい点はノイズとして無視
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area > 10: 
+            leaf_centers.append(centroids[i])
+
+    # デバッグ：検出した全ての「葉の中心」に青い点を打つ（確認用）
+    for pt in leaf_centers:
+        cv2.circle(output_img, (int(pt[0]), int(pt[1])), 2, (255, 0, 0), -1)
+
+    # --- STEP 4: クラスタリング（4つ密集している場所を探す） ---
+    # 単純な総当たり：ある点から半径R以内に、自分を含めて「ちょうど4個」点があるか？
+    
+    # 探索半径の決定：
+    # 葉っぱのサイズに依存するが、ここでは「画像の幅の5%」程度と仮定して動的に決める
+    search_radius = img.shape[1] * 0.05 
+    found_clovers = []
+
+    for i, p1 in enumerate(leaf_centers):
+        neighbors = []
+        for j, p2 in enumerate(leaf_centers):
+            # 距離計算
+            dist = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+            if dist < search_radius:
+                neighbors.append(p2)
         
-        # 小さすぎるゴミと、画面全体を覆うような巨大な塊は無視
-        if area < 500 or area > (img.shape[0] * img.shape[1] / 2):
-            continue
+        # 近傍点が4つ（自分含む）なら四葉候補！
+        if len(neighbors) == 4:
+            # 4点の重心を計算
+            cx = int(sum([p[0] for p in neighbors]) / 4)
+            cy = int(sum([p[1] for p in neighbors]) / 4)
             
-        # 輪郭を少し滑らかにする（ギザギザ対策）
-        epsilon = 0.02 * cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, epsilon, True)
-        
-        # 凸包（輪郭の外側をゴムバンドで囲んだような形）を計算
-        hull = cv2.convexHull(approx, returnPoints=False)
-        
-        # 凸包が計算できない形状はスキップ
-        if hull is None or len(hull) <= 3:
-            continue
+            # 重複検出を防ぐ（すでに近い場所に候補があればスキップ）
+            is_new = True
+            for exist in found_clovers:
+                if np.sqrt((exist[0]-cx)**2 + (exist[1]-cy)**2) < 20:
+                    is_new = False
+                    break
             
-        try:
-            # Convexity Defects（凹みの検出）
-            # 輪郭と凸包の間の「隙間」を探す
-            defects = cv2.convexityDefects(approx, hull)
-        except:
-            continue
-            
-        if defects is None:
-            continue
-            
-        indentation_count = 0
-        
-        # 各「凹み」をチェック
-        for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
-            # d は凹みの深さ（距離）
-            # ある程度深い凹みだけをカウント（葉っぱの隙間とみなす）
-            if d > 1000: # この閾値は画像の解像度によるが、一旦固定値で
-                indentation_count += 1
-        
-        # 判定ロジック：凹みが4つ以上あれば「四つ葉候補」
-        # クローバーの葉は丸いので、凹み（谷）の数が葉の数と相関する
-        if indentation_count >= 4:
-            # 重心計算
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cX = int(M["m10"] / M["m00"])
-                cY = int(M["m01"] / M["m00"])
+            if is_new:
+                found_clovers.append((cx, cy))
+                print(f"Clover found at ({cx}, {cy})")
                 
-                # 外接円を取得（描画用サイズ）
-                (x,y), radius = cv2.minEnclosingCircle(cnt)
-                
-                candidates.append({
-                    'x': cX, 'y': cY, 'r': int(radius), 
-                    'score': indentation_count # 凹みが多いほど複雑＝四葉っぽい？
-                })
+                # 赤丸描画
+                cv2.circle(output_img, (cx, cy), int(search_radius), (0, 0, 255), 4)
+                cv2.putText(output_img, "LUCKY!", (cx-20, cy-20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-    # --- STEP 4: 結果描画 ---
-    print(f"Candidates found: {len(candidates)}")
-    
-    if len(candidates) == 0:
-        # 何も見つからなかった場合、一番「複雑な形」を無理やりマークする（ネタ用）
-        print("No strict candidates. Force detection mode.")
-        if len(contours) > 0:
-             # 面積がある程度大きいものの中からランダムに...ではなく面積最大のものなどを選ぶ
-             cnt = max(contours, key=cv2.contourArea)
-             (x,y), radius = cv2.minEnclosingCircle(cnt)
-             candidates.append({'x': int(x), 'y': int(y), 'r': int(radius), 'score': 0})
+    # 1つも見つからなかった場合のやけくそ処理（3つ組をマーク）
+    if len(found_clovers) == 0:
+        print("No 4-leaf found. Marking 3-leaf clusters as backup.")
+        for i, p1 in enumerate(leaf_centers):
+            neighbors = []
+            for j, p2 in enumerate(leaf_centers):
+                dist = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+                if dist < search_radius:
+                    neighbors.append(p2)
+            if len(neighbors) == 3:
+                 cx = int(sum([p[0] for p in neighbors]) / 3)
+                 cy = int(sum([p[1] for p in neighbors]) / 3)
+                 # 黄色でマーク
+                 cv2.circle(output_img, (cx, cy), int(search_radius), (0, 255, 255), 2)
 
-    for c in candidates:
-        # 赤丸描画
-        cv2.circle(output_img, (c['x'], c['y']), c['r'] + 10, (0, 0, 255), 5)
-        # スコア（凹みの数）を表示
-        cv2.putText(output_img, f"Lv.{c['score']}", (c['x'] - 20, c['y']), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-
-    # 保存
-    filename, ext = os.path.splitext(input_path)
-    output_path = f"clover_marked.png"
-    cv2.imwrite(output_path, output_img)
-    print(f"Saved to {output_path}")
+    # --- 保存 ---
+    cv2.imwrite("clover_marked.png", output_img)
+    print("Saved clover_marked.png")
 
 if __name__ == "__main__":
     main()
